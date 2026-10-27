@@ -5,4 +5,11 @@
 	<IncludePath>$(SolutionDir)\util\sdkfix;$(IncludePath)</IncludePath>
 </PropertyGroup>
 
+<ItemDefinitionGroup>
+  <ClCompile>
+    <!-- Injected modules may share an older app-local MSVC runtime with the target. -->
+    <PreprocessorDefinitions>_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+  </ClCompile>
+</ItemDefinitionGroup>
+
 </Project>

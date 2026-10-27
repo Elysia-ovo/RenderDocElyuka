@@ -72,6 +72,15 @@ typedef CriticalSectionTemplate<CRITICAL_SECTION> CriticalSection;
 typedef RWLockTemplate<SRWLOCK> RWLock;
 };
 
+namespace Process
+{
+// Internal Windows-only entry point for child processes that were deliberately created suspended.
+rdcpair<RDResult, uint32_t> InjectIntoSuspendedProcess(uint32_t pid, HANDLE suspendedPrimaryThread,
+                                                       const rdcarray<EnvironmentModification> &env,
+                                                       const rdcstr &capturefile,
+                                                       const CaptureOptions &opts, bool waitForExit);
+};
+
 namespace Bits
 {
 inline uint32_t CountLeadingZeroes(uint32_t value)

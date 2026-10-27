@@ -26,7 +26,16 @@
 #include "renderdoccmd.h"
 #include <app/renderdoc_app.h>
 #include <replay/version.h>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 #include <string>
+
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) ExecuteResult RENDERDOC_CC INTERNAL_InjectIntoSuspendedProcess(
+    uint32_t pid, uintptr_t suspendedPrimaryThread, const rdcarray<EnvironmentModification> &env,
+    const rdcstr &capturefile, const CaptureOptions &opts);
+#endif
 
 rdcstr conv(const std::string &s)
 {
@@ -915,6 +924,7 @@ private:
   rdcarray<EnvironmentModification> env;
   std::string debuglog;
   uint32_t pid;
+  uintptr_t suspendedPrimaryThread = 0;
   std::string capfile;
 
 public:
@@ -922,6 +932,7 @@ public:
   virtual void AddOptions(cmdline::parser &parser)
   {
     parser.add<uint32_t>("pid", 0, "");
+    parser.add<std::string>("thread-handle", 0, "", false, "");
     parser.add<std::string>("capfile", 0, "");
     parser.add<std::string>("debuglog", 0, "");
     parser.add<std::string>("capopts", 0, "");
@@ -1013,13 +1024,38 @@ public:
     pid = parser.get<uint32_t>("pid");
     capfile = parser.get<std::string>("capfile");
 
+    std::string threadHandleString = parser.get<std::string>("thread-handle");
+    if(!threadHandleString.empty())
+    {
+      errno = 0;
+      char *end = NULL;
+      unsigned long long value = strtoull(threadHandleString.c_str(), &end, 10);
+
+      if(errno != 0 || end == threadHandleString.c_str() || *end != 0 ||
+         value > (unsigned long long)std::numeric_limits<uintptr_t>::max())
+      {
+        std::cerr << "Invalid generated suspended thread handle" << std::endl;
+        return false;
+      }
+
+      suspendedPrimaryThread = (uintptr_t)value;
+    }
+
     return true;
   }
   virtual int Execute(const CaptureOptions &)
   {
     RENDERDOC_SetDebugLogFile(conv(debuglog));
 
-    ExecuteResult result = RENDERDOC_InjectIntoProcess(pid, env, conv(capfile), cmdopts, false);
+    ExecuteResult result;
+
+#if defined(_WIN32)
+    if(suspendedPrimaryThread != 0)
+      result = INTERNAL_InjectIntoSuspendedProcess(pid, suspendedPrimaryThread, env, conv(capfile),
+                                                   cmdopts);
+    else
+#endif
+      result = RENDERDOC_InjectIntoProcess(pid, env, conv(capfile), cmdopts, false);
 
     if(result.result.OK())
       return result.ident;

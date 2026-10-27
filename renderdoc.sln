@@ -5,9 +5,9 @@ VisualStudioVersion = 14.0.25420.1
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "UI", "UI", "{89059266-9C4E-4637-AB1D-BFF1DC15096B}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "qrenderdoc", "qrenderdoc\qrenderdoc_local.vcxproj", "{A14A6AE5-02B1-35FE-BE59-B3E7C273B40B}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "qrendertest", "qrenderdoc\qrenderdoc_local.vcxproj", "{A14A6AE5-02B1-35FE-BE59-B3E7C273B40B}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "renderdoc", "renderdoc\renderdoc.vcxproj", "{E2B46D67-90E2-40B6-9597-72930E7845E5}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "rendertest", "renderdoc\renderdoc.vcxproj", "{E2B46D67-90E2-40B6-9597-72930E7845E5}"
 	ProjectSection(ProjectDependencies) = postProject
 		{7893E300-3ED0-7F4C-158F-67EA63934C57} = {7893E300-3ED0-7F4C-158F-67EA63934C57}
 		{EC847717-119A-2391-0477-212E1140082C} = {EC847717-119A-2391-0477-212E1140082C}
@@ -18,7 +18,7 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "renderdoc", "renderdoc\rend
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "DLL", "DLL", "{B1FB29A4-9C48-4D47-BAEF-CF14CB2A40A3}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "renderdoccmd", "renderdoccmd\renderdoccmd.vcxproj", "{D03DF2F9-513C-4084-BBDD-1DEE8D9250D7}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "rendertestcmd", "renderdoccmd\renderdoccmd.vcxproj", "{D03DF2F9-513C-4084-BBDD-1DEE8D9250D7}"
 	ProjectSection(ProjectDependencies) = postProject
 		{7893E300-3ED0-7F4C-158F-67EA63934C57} = {7893E300-3ED0-7F4C-158F-67EA63934C57}
 		{EC847717-119A-2391-0477-212E1140082C} = {EC847717-119A-2391-0477-212E1140082C}
@@ -39,7 +39,7 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "crash_generation_server", "
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "exception_handler", "renderdoc\3rdparty\breakpad\client\windows\handler\exception_handler.vcxproj", "{B7399F39-300F-450E-F471-9490F959D2A7}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "renderdocshim", "renderdocshim\renderdocshim.vcxproj", "{6DEE3F12-F2F8-42CA-865A-578D0FD11387}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "rendertestshim", "renderdocshim\renderdocshim.vcxproj", "{6DEE3F12-F2F8-42CA-865A-578D0FD11387}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "drivers", "drivers", "{864A44B0-5612-451A-857F-41E3EF785EF6}"
 EndProject
@@ -73,7 +73,7 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "qrenderdoc_module", "qrende
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "version", "renderdoc\renderdoc_version.vcxproj", "{257FD75C-4D17-4A23-A754-23BFD85887A0}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "renderdocui_stub", "qrenderdoc\renderdocui_stub.vcxproj", "{37955C79-D91D-423F-8C6C-8F5BCF4F28D4}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "rendertestui_stub", "qrenderdoc\renderdocui_stub.vcxproj", "{37955C79-D91D-423F-8C6C-8F5BCF4F28D4}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "NV", "renderdoc\driver\ihv\nv\NV.vcxproj", "{40349AD9-5558-4DF4-84E2-11934DE90A11}"
 EndProject

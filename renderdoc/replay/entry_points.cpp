@@ -416,6 +416,26 @@ RENDERDOC_InjectIntoProcess(uint32_t pid, const rdcarray<EnvironmentModification
   return ret;
 }
 
+#if ENABLED(RDOC_WIN32)
+// Internal entry point used only by the alternate-bitness command-line helper. The handle was
+// explicitly inherited by that helper and is owned here.
+extern "C" RENDERDOC_API ExecuteResult RENDERDOC_CC INTERNAL_InjectIntoSuspendedProcess(
+    uint32_t pid, uintptr_t suspendedPrimaryThread, const rdcarray<EnvironmentModification> &env,
+    const rdcstr &capturefile, const CaptureOptions &opts)
+{
+  HANDLE threadHandle = (HANDLE)suspendedPrimaryThread;
+  rdcpair<RDResult, uint32_t> status =
+      Process::InjectIntoSuspendedProcess(pid, threadHandle, env, capturefile, opts, false);
+
+  CloseHandle(threadHandle);
+
+  ExecuteResult ret;
+  ret.result = status.first;
+  ret.ident = status.second;
+  return ret;
+}
+#endif
+
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_FreeArrayMem(void *mem)
 {
   free(mem);

@@ -249,38 +249,356 @@ extern "C" __declspec(dllexport) void __cdecl INTERNAL_ApplyEnvMods(void *ignore
   Process::ApplyEnvironmentModification();
 }
 
-void InjectDLL(HANDLE hProcess, rdcwstr libName)
+enum class ContextInjectionResult
+{
+  Succeeded,
+  SafeToFallback,
+  FailedAfterExecution,
+};
+
+enum class RemoteInvokeResult
+{
+  Succeeded,
+  FailedSafe,
+  FailedUnsafe,
+};
+
+struct RemoteCallState
+{
+  uintptr_t result;
+  uint32_t completed;
+};
+
+// Executes a one-argument function on the primary thread of a process that RenderDoc itself created
+// with CREATE_SUSPENDED. We deliberately don't enumerate or hijack a thread in an already-running
+// process: there is no reliable way to know whether such a thread owns the loader lock, is
+// unwinding, or is otherwise at a safe call boundary.
+//
+// The trampoline writes its return value and completion flag, then parks in a small loop. Only
+// after observing completion do we suspend the thread, verify that it is parked, and restore its
+// complete original context. The thread is left suspended, preserving the CREATE_SUSPENDED contract
+// for the rest of the injection sequence.
+static ContextInjectionResult InjectViaSetThreadContext(HANDLE hProcess, HANDLE hThread,
+                                                        void *remoteFunc, void *remoteArg,
+                                                        uintptr_t *callResult)
+{
+  if(hThread == NULL)
+    return ContextInjectionResult::SafeToFallback;
+
+  CONTEXT origCtx;
+  RDCEraseEl(origCtx);
+  origCtx.ContextFlags = CONTEXT_ALL;
+
+  if(!GetThreadContext(hThread, &origCtx))
+  {
+    RDCERR("Couldn't get suspended primary thread context: %u", GetLastError());
+    return ContextInjectionResult::SafeToFallback;
+  }
+
+  void *stateMem = VirtualAllocEx(hProcess, NULL, sizeof(RemoteCallState), MEM_COMMIT | MEM_RESERVE,
+                                  PAGE_READWRITE);
+  if(stateMem == NULL)
+  {
+    RDCERR("Couldn't allocate remote call state: %u", GetLastError());
+    return ContextInjectionResult::SafeToFallback;
+  }
+
+#if defined(_M_X64) || defined(__x86_64__)
+  static_assert(offsetof(RemoteCallState, completed) == 8,
+                "Unexpected x64 remote call state layout");
+
+  unsigned char shellcode[] = {
+      0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,    // mov rcx, arg
+      0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,    // mov rax, func
+      0xFF, 0xD0,                                                    // call rax
+      0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,    // mov rdx, state
+      0x48, 0x89, 0x02,                                              // mov [rdx], rax
+      0xC7, 0x42, 0x08, 0x01, 0x00, 0x00, 0x00,                      // mov [rdx+8], 1
+      0xF3, 0x90,                                                    // pause
+      0xEB, 0xFC,                                                    // jmp pause
+  };
+
+  const size_t loopOffset = 42;
+  uintptr_t arg = (uintptr_t)remoteArg;
+  uintptr_t func = (uintptr_t)remoteFunc;
+  uintptr_t stateAddr = (uintptr_t)stateMem;
+  memcpy(shellcode + 2, &arg, sizeof(arg));
+  memcpy(shellcode + 12, &func, sizeof(func));
+  memcpy(shellcode + 24, &stateAddr, sizeof(stateAddr));
+#else
+  static_assert(offsetof(RemoteCallState, completed) == 4,
+                "Unexpected x86 remote call state layout");
+
+  unsigned char shellcode[] = {
+      0x68, 0x00, 0x00, 0x00, 0x00,                // push arg
+      0xB8, 0x00, 0x00, 0x00, 0x00,                // mov eax, func
+      0xFF, 0xD0,                                  // call eax
+      0xBA, 0x00, 0x00, 0x00, 0x00,                // mov edx, state
+      0x89, 0x02,                                  // mov [edx], eax
+      0xC7, 0x42, 0x04, 0x01, 0x00, 0x00, 0x00,    // mov [edx+4], 1
+      0xF3, 0x90,                                  // pause
+      0xEB, 0xFC,                                  // jmp pause
+  };
+
+  const size_t loopOffset = 26;
+  uintptr_t arg = (uintptr_t)remoteArg;
+  uintptr_t func = (uintptr_t)remoteFunc;
+  uintptr_t stateAddr = (uintptr_t)stateMem;
+  memcpy(shellcode + 1, &arg, sizeof(arg));
+  memcpy(shellcode + 6, &func, sizeof(func));
+  memcpy(shellcode + 13, &stateAddr, sizeof(stateAddr));
+#endif
+
+  void *shellcodeMem =
+      VirtualAllocEx(hProcess, NULL, sizeof(shellcode), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if(shellcodeMem == NULL)
+  {
+    RDCERR("Couldn't allocate remote trampoline: %u", GetLastError());
+    VirtualFreeEx(hProcess, stateMem, 0, MEM_RELEASE);
+    return ContextInjectionResult::SafeToFallback;
+  }
+
+  SIZE_T written = 0;
+  if(!WriteProcessMemory(hProcess, shellcodeMem, shellcode, sizeof(shellcode), &written) ||
+     written != sizeof(shellcode))
+  {
+    RDCERR("Couldn't write complete remote trampoline: %u", GetLastError());
+    VirtualFreeEx(hProcess, shellcodeMem, 0, MEM_RELEASE);
+    VirtualFreeEx(hProcess, stateMem, 0, MEM_RELEASE);
+    return ContextInjectionResult::SafeToFallback;
+  }
+
+  DWORD oldProtect = 0;
+  if(!VirtualProtectEx(hProcess, shellcodeMem, sizeof(shellcode), PAGE_EXECUTE_READ, &oldProtect) ||
+     !FlushInstructionCache(hProcess, shellcodeMem, sizeof(shellcode)))
+  {
+    RDCERR("Couldn't make remote trampoline executable: %u", GetLastError());
+    VirtualFreeEx(hProcess, shellcodeMem, 0, MEM_RELEASE);
+    VirtualFreeEx(hProcess, stateMem, 0, MEM_RELEASE);
+    return ContextInjectionResult::SafeToFallback;
+  }
+
+  CONTEXT callCtx = origCtx;
+
+#if defined(_M_X64) || defined(__x86_64__)
+  callCtx.Rip = (DWORD64)shellcodeMem;
+
+  // Present a valid Windows x64 call site. The pre-call RSP is 16-byte aligned and the 32 bytes
+  // above it are reserved as the mandatory shadow store. The original RSP is restored afterwards.
+  callCtx.Rsp = (origCtx.Rsp & ~DWORD64(0xF)) - 0x40;
+#else
+  callCtx.Eip = (DWORD)(uintptr_t)shellcodeMem;
+  callCtx.Esp = (origCtx.Esp & ~DWORD(0xF)) - 0x40;
+#endif
+
+  if(!SetThreadContext(hThread, &callCtx))
+  {
+    RDCERR("Couldn't redirect suspended primary thread: %u", GetLastError());
+    VirtualFreeEx(hProcess, shellcodeMem, 0, MEM_RELEASE);
+    VirtualFreeEx(hProcess, stateMem, 0, MEM_RELEASE);
+    return ContextInjectionResult::SafeToFallback;
+  }
+
+  // The known primary thread must have exactly the one suspension applied by CREATE_SUSPENDED.
+  // If there is another suspension, restore both the context and the count without executing code.
+  DWORD previousSuspendCount = ResumeThread(hThread);
+  if(previousSuspendCount != 1)
+  {
+    RDCERR("Unexpected primary thread suspend count %u", previousSuspendCount);
+
+    if(previousSuspendCount == 0)
+      return ContextInjectionResult::FailedAfterExecution;
+
+    if(previousSuspendCount == (DWORD)-1)
+    {
+      if(SetThreadContext(hThread, &origCtx))
+      {
+        VirtualFreeEx(hProcess, shellcodeMem, 0, MEM_RELEASE);
+        VirtualFreeEx(hProcess, stateMem, 0, MEM_RELEASE);
+        return ContextInjectionResult::SafeToFallback;
+      }
+
+      return ContextInjectionResult::FailedAfterExecution;
+    }
+
+    bool restored = SetThreadContext(hThread, &origCtx) != FALSE;
+    SuspendThread(hThread);
+
+    if(restored)
+    {
+      VirtualFreeEx(hProcess, shellcodeMem, 0, MEM_RELEASE);
+      VirtualFreeEx(hProcess, stateMem, 0, MEM_RELEASE);
+      return ContextInjectionResult::SafeToFallback;
+    }
+
+    return ContextInjectionResult::FailedAfterExecution;
+  }
+
+  // Once resumed, never fall back to another remote call. We wait just as the old
+  // CreateRemoteThread path did, but without repeatedly suspending a thread inside LoadLibrary.
+  RemoteCallState state = {};
+  uint32_t waitIterations = 0;
+
+  for(;;)
+  {
+    SIZE_T read = 0;
+    if(ReadProcessMemory(hProcess, stateMem, &state, sizeof(state), &read) &&
+       read == sizeof(state) && state.completed == 1)
+      break;
+
+    if(WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0)
+    {
+      RDCERR("Target exited while executing the remote trampoline");
+      return ContextInjectionResult::FailedAfterExecution;
+    }
+
+    Sleep(1);
+
+    waitIterations++;
+    if(waitIterations % 30000 == 0)
+      RDCWARN("Still waiting for the remote trampoline to complete");
+  }
+
+  const uintptr_t loopBegin = (uintptr_t)shellcodeMem + loopOffset;
+  const uintptr_t loopEnd = (uintptr_t)shellcodeMem + sizeof(shellcode);
+
+  // The completion store immediately precedes the parking loop. Suspend only after observing it,
+  // and retry if the thread was caught in the few instructions between the store and the loop.
+  for(;;)
+  {
+    if(SuspendThread(hThread) == (DWORD)-1)
+    {
+      if(WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0)
+        return ContextInjectionResult::FailedAfterExecution;
+
+      Sleep(1);
+      continue;
+    }
+
+    CONTEXT parkedCtx;
+    RDCEraseEl(parkedCtx);
+    parkedCtx.ContextFlags = CONTEXT_CONTROL;
+
+    if(!GetThreadContext(hThread, &parkedCtx))
+    {
+      ResumeThread(hThread);
+      Sleep(1);
+      continue;
+    }
+
+#if defined(_M_X64) || defined(__x86_64__)
+    uintptr_t ip = (uintptr_t)parkedCtx.Rip;
+#else
+    uintptr_t ip = (uintptr_t)parkedCtx.Eip;
+#endif
+
+    if(ip < loopBegin || ip >= loopEnd)
+    {
+      ResumeThread(hThread);
+      Sleep(0);
+      continue;
+    }
+
+    if(!SetThreadContext(hThread, &origCtx))
+    {
+      RDCERR("Couldn't restore primary thread context: %u", GetLastError());
+      // Leave the thread suspended and the trampoline allocated. Resuming or freeing either here
+      // would execute invalid state.
+      return ContextInjectionResult::FailedAfterExecution;
+    }
+
+    if(callResult)
+      *callResult = state.result;
+
+    VirtualFreeEx(hProcess, shellcodeMem, 0, MEM_RELEASE);
+    VirtualFreeEx(hProcess, stateMem, 0, MEM_RELEASE);
+
+    // Deliberately do not resume. This recreates the one CREATE_SUSPENDED count that was borrowed
+    // to run the trampoline, so subsequent setup calls and the caller see the original state.
+    return ContextInjectionResult::Succeeded;
+  }
+}
+
+static RemoteInvokeResult InvokeRemoteFunction(HANDLE hProcess, HANDLE suspendedPrimaryThread,
+                                               void *remoteFunc, void *remoteArg,
+                                               uintptr_t *callResult = NULL)
+{
+  if(remoteFunc == NULL)
+  {
+    RDCERR("Cannot invoke a null remote function");
+    return RemoteInvokeResult::FailedSafe;
+  }
+
+  if(suspendedPrimaryThread != NULL)
+  {
+    ContextInjectionResult contextResult = InjectViaSetThreadContext(
+        hProcess, suspendedPrimaryThread, remoteFunc, remoteArg, callResult);
+
+    if(contextResult == ContextInjectionResult::Succeeded)
+      return RemoteInvokeResult::Succeeded;
+
+    if(contextResult == ContextInjectionResult::FailedAfterExecution)
+      return RemoteInvokeResult::FailedUnsafe;
+
+    RDCWARN("Context injection could not start safely; using the remote-thread compatibility path");
+  }
+
+  HANDLE hThread = CreateRemoteThread(hProcess, NULL, 1024 * 1024U,
+                                      (LPTHREAD_START_ROUTINE)remoteFunc, remoteArg, 0, NULL);
+  if(hThread == NULL)
+  {
+    RDCERR("Couldn't create compatibility remote thread: %u", GetLastError());
+    return RemoteInvokeResult::FailedSafe;
+  }
+
+  DWORD waitResult = WaitForSingleObject(hThread, INFINITE);
+  CloseHandle(hThread);
+
+  if(waitResult != WAIT_OBJECT_0)
+  {
+    RDCERR("Error waiting for compatibility remote thread: %u", GetLastError());
+    return RemoteInvokeResult::FailedUnsafe;
+  }
+
+  return RemoteInvokeResult::Succeeded;
+}
+
+static RemoteInvokeResult InjectDLL(HANDLE hProcess, HANDLE suspendedPrimaryThread, rdcwstr libName)
 {
   wchar_t dllPath[MAX_PATH + 1] = {0};
-  wcscpy_s(dllPath, libName.c_str());
+
+  if(libName.length() > MAX_PATH || wcscpy_s(dllPath, libName.c_str()) != 0)
+  {
+    RDCERR("DLL path is too long to inject: '%ls'", libName.c_str());
+    return RemoteInvokeResult::FailedSafe;
+  }
 
   static HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
 
   if(kernel32 == NULL)
   {
     RDCERR("Couldn't get handle for kernel32.dll");
-    return;
+    return RemoteInvokeResult::FailedSafe;
   }
 
   void *remoteMem =
-      VirtualAllocEx(hProcess, NULL, sizeof(dllPath), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+      VirtualAllocEx(hProcess, NULL, sizeof(dllPath), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   if(remoteMem)
   {
-    BOOL success = WriteProcessMemory(hProcess, remoteMem, (void *)dllPath, sizeof(dllPath), NULL);
-    if(success)
+    SIZE_T written = 0;
+    BOOL success =
+        WriteProcessMemory(hProcess, remoteMem, (void *)dllPath, sizeof(dllPath), &written);
+    if(success && written == sizeof(dllPath))
     {
-      HANDLE hThread = CreateRemoteThread(
-          hProcess, NULL, 1024 * 1024U,
-          (LPTHREAD_START_ROUTINE)GetProcAddress(kernel32, "LoadLibraryW"), remoteMem, 0, NULL);
-      if(hThread)
-      {
-        WaitForSingleObject(hThread, INFINITE);
-        CloseHandle(hThread);
-      }
-      else
-      {
-        RDCERR("Couldn't create remote thread for LoadLibraryW: %u", GetLastError());
-      }
+      void *loadLibAddr = (void *)GetProcAddress(kernel32, "LoadLibraryW");
+      uintptr_t module = 0;
+      RemoteInvokeResult result =
+          InvokeRemoteFunction(hProcess, suspendedPrimaryThread, loadLibAddr, remoteMem, &module);
+
+      if(result != RemoteInvokeResult::FailedUnsafe)
+        VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+
+      return result;
     }
     else
     {
@@ -294,6 +612,8 @@ void InjectDLL(HANDLE hProcess, rdcwstr libName)
   {
     RDCERR("Couldn't allocate remote memory for DLL '%ls': %u", libName.c_str(), GetLastError());
   }
+
+  return RemoteInvokeResult::FailedSafe;
 }
 
 uintptr_t FindRemoteDLL(DWORD pid, rdcstr libName)
@@ -398,38 +718,71 @@ uintptr_t FindRemoteDLL(DWORD pid, rdcstr libName)
   return ret;
 }
 
-void InjectFunctionCall(HANDLE hProcess, uintptr_t renderdoc_remote, const char *funcName,
-                        void *data, const size_t dataLen)
+static RemoteInvokeResult InjectFunctionCall(HANDLE hProcess, HANDLE suspendedPrimaryThread,
+                                             uintptr_t renderdoc_remote, const char *funcName,
+                                             void *data, const size_t dataLen)
 {
-  if(dataLen == 0)
+  if(funcName == NULL || data == NULL || dataLen == 0 || renderdoc_remote == 0)
   {
     RDCERR("Invalid function call injection attempt");
-    return;
+    return RemoteInvokeResult::FailedSafe;
   }
 
   RDCDEBUG("Injecting call to %s", funcName);
 
   HMODULE renderdoc_local = GetModuleHandleA(STRINGIZE(RDOC_BASE_NAME) ".dll");
 
+  if(renderdoc_local == NULL)
+  {
+    RDCERR("Couldn't get the local %s.dll module", STRINGIZE(RDOC_BASE_NAME));
+    return RemoteInvokeResult::FailedSafe;
+  }
+
   uintptr_t func_local = (uintptr_t)GetProcAddress(renderdoc_local, funcName);
+
+  if(func_local == 0)
+  {
+    RDCERR("Couldn't find local export %s", funcName);
+    return RemoteInvokeResult::FailedSafe;
+  }
 
   // we've found SetCaptureOptions in our local instance of the module, now calculate the offset and
   // so get the function
   // in the remote module (which might be loaded at a different base address
   uintptr_t func_remote = func_local + renderdoc_remote - (uintptr_t)renderdoc_local;
 
-  void *remoteMem = VirtualAllocEx(hProcess, NULL, dataLen, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-  SIZE_T numWritten;
-  WriteProcessMemory(hProcess, remoteMem, data, dataLen, &numWritten);
+  void *remoteMem = VirtualAllocEx(hProcess, NULL, dataLen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if(remoteMem == NULL)
+  {
+    RDCERR("Couldn't allocate remote parameter memory for %s: %u", funcName, GetLastError());
+    return RemoteInvokeResult::FailedSafe;
+  }
 
-  HANDLE hThread =
-      CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)func_remote, remoteMem, 0, NULL);
-  WaitForSingleObject(hThread, INFINITE);
+  SIZE_T numWritten = 0;
+  if(!WriteProcessMemory(hProcess, remoteMem, data, dataLen, &numWritten) || numWritten != dataLen)
+  {
+    RDCERR("Couldn't write complete remote parameters for %s: %u", funcName, GetLastError());
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    return RemoteInvokeResult::FailedSafe;
+  }
 
-  ReadProcessMemory(hProcess, remoteMem, data, dataLen, &numWritten);
+  RemoteInvokeResult result =
+      InvokeRemoteFunction(hProcess, suspendedPrimaryThread, (void *)func_remote, remoteMem);
 
-  CloseHandle(hThread);
-  VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+  if(result == RemoteInvokeResult::Succeeded)
+  {
+    SIZE_T numRead = 0;
+    if(!ReadProcessMemory(hProcess, remoteMem, data, dataLen, &numRead) || numRead != dataLen)
+    {
+      RDCERR("Couldn't read complete remote parameters for %s: %u", funcName, GetLastError());
+      result = RemoteInvokeResult::FailedSafe;
+    }
+  }
+
+  if(result != RemoteInvokeResult::FailedUnsafe)
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+
+  return result;
 }
 
 static PROCESS_INFORMATION RunProcess(const rdcstr &app, const rdcstr &workingDir,
@@ -571,10 +924,9 @@ static PROCESS_INFORMATION RunProcess(const rdcstr &app, const rdcstr &workingDi
   return pi;
 }
 
-rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
-                                                       const rdcarray<EnvironmentModification> &env,
-                                                       const rdcstr &capturefile,
-                                                       const CaptureOptions &opts, bool waitForExit)
+static rdcpair<RDResult, uint32_t> InjectIntoProcessInternal(
+    uint32_t pid, const rdcarray<EnvironmentModification> &env, const rdcstr &capturefile,
+    const CaptureOptions &opts, bool waitForExit, HANDLE suspendedPrimaryThread)
 {
   rdcwstr wcapturefile = StringFormat::UTF82Wide(capturefile);
 
@@ -735,7 +1087,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
       renderdocPath[idx] = 0;
 
-      wcscat_s(renderdocPath, L"\\Win32\\Development\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\Win32\\Development\\rendertestcmd.exe");
     }
 
     if(!devLocation)
@@ -748,7 +1100,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
         renderdocPath[idx] = 0;
 
-        wcscat_s(renderdocPath, L"\\Win32\\Release\\renderdoccmd.exe");
+        wcscat_s(renderdocPath, L"\\Win32\\Release\\rendertestcmd.exe");
       }
     }
 
@@ -763,7 +1115,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
         *slash = 0;
 
       // append path
-      wcscat_s(renderdocPath, L"\\x86\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\x86\\rendertestcmd.exe");
     }
 #else
     // if it looks like we're in the development environment, look for the alternate bitness in the
@@ -775,7 +1127,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
       renderdocPath[idx] = 0;
 
-      wcscat_s(renderdocPath, L"\\x64\\Development\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\x64\\Development\\rendertestcmd.exe");
     }
 
     if(!devLocation)
@@ -788,7 +1140,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
         renderdocPath[idx] = 0;
 
-        wcscat_s(renderdocPath, L"\\x64\\Release\\renderdoccmd.exe");
+        wcscat_s(renderdocPath, L"\\x64\\Release\\rendertestcmd.exe");
       }
     }
 
@@ -808,7 +1160,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
         *slash = 0;
 
       // append path
-      wcscat_s(renderdocPath, L"\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\rendertestcmd.exe");
     }
 #endif
 
@@ -830,6 +1182,75 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
     pSec.nLength = sizeof(pSec);
     tSec.nLength = sizeof(tSec);
 
+    // If this is a cross-bitness launch, pass the already-suspended target primary thread to the
+    // alternate-bitness helper. Restrict inheritance to this single duplicate so the helper does
+    // not accidentally receive unrelated handles from the UI or captured process.
+    HANDLE inheritedPrimaryThread = NULL;
+    STARTUPINFOEXW extendedSi;
+    RDCEraseEl(extendedSi);
+    unsigned char *attributeStorage = NULL;
+    bool attributeListInitialised = false;
+    LPSTARTUPINFOW startupInfo = &si;
+    DWORD helperCreationFlags = CREATE_NEW_CONSOLE | CREATE_SUSPENDED;
+    BOOL inheritHandles = FALSE;
+
+    if(suspendedPrimaryThread != NULL)
+    {
+      if(!DuplicateHandle(GetCurrentProcess(), suspendedPrimaryThread, GetCurrentProcess(),
+                          &inheritedPrimaryThread, 0, TRUE, DUPLICATE_SAME_ACCESS))
+      {
+        RDCWARN("Couldn't duplicate suspended primary thread for alternate-bitness helper: %u",
+                GetLastError());
+      }
+      else
+      {
+        SIZE_T attributeBytes = 0;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &attributeBytes);
+
+        if(attributeBytes > 0)
+        {
+          attributeStorage = new unsigned char[attributeBytes];
+          extendedSi.StartupInfo = si;
+          extendedSi.StartupInfo.cb = sizeof(extendedSi);
+          extendedSi.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)(void *)attributeStorage;
+
+          attributeListInitialised = InitializeProcThreadAttributeList(
+                                         extendedSi.lpAttributeList, 1, 0, &attributeBytes) != FALSE;
+
+          if(attributeListInitialised &&
+             UpdateProcThreadAttribute(extendedSi.lpAttributeList, 0,
+                                       PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inheritedPrimaryThread,
+                                       sizeof(inheritedPrimaryThread), NULL, NULL))
+          {
+            startupInfo = &extendedSi.StartupInfo;
+            helperCreationFlags |= EXTENDED_STARTUPINFO_PRESENT;
+            inheritHandles = TRUE;
+          }
+          else
+          {
+            RDCWARN("Couldn't restrict handle inheritance for alternate-bitness helper: %u",
+                    GetLastError());
+
+            if(attributeListInitialised)
+              DeleteProcThreadAttributeList(extendedSi.lpAttributeList);
+
+            SAFE_DELETE_ARRAY(attributeStorage);
+            extendedSi.lpAttributeList = NULL;
+            attributeListInitialised = false;
+            CloseHandle(inheritedPrimaryThread);
+            inheritedPrimaryThread = NULL;
+          }
+        }
+        else
+        {
+          RDCWARN("Couldn't size handle inheritance list for alternate-bitness helper: %u",
+                  GetLastError());
+          CloseHandle(inheritedPrimaryThread);
+          inheritedPrimaryThread = NULL;
+        }
+      }
+    }
+
     // serialise to string with two chars per byte
     rdcstr optstr = opts.EncodeAsString();
 
@@ -840,8 +1261,10 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
     _snwprintf_s(
         paramsAlloc, 2047, 2047,
-        L"\"%ls\" capaltbit --pid=%u --capfile=\"%ls\" --debuglog=\"%ls\" --capopts=\"%hs\"",
-        renderdocPath, pid, wcapturefile.c_str(), wdebugLogfile.c_str(), optstr.c_str());
+        L"\"%ls\" capaltbit --pid=%u --thread-handle=%llu --capfile=\"%ls\" --debuglog=\"%ls\" "
+        L"--capopts=\"%hs\"",
+        renderdocPath, pid, (unsigned long long)(uintptr_t)inheritedPrimaryThread,
+        wcapturefile.c_str(), wdebugLogfile.c_str(), optstr.c_str());
 
     RDCDEBUG("params %ls", paramsAlloc);
 
@@ -916,8 +1339,16 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
       commandLine = (wchar_t *)cmdWithEnv.c_str();
     }
 
-    BOOL retValue = CreateProcessW(NULL, commandLine, &pSec, &tSec, false,
-                                   CREATE_NEW_CONSOLE | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+    BOOL retValue = CreateProcessW(NULL, commandLine, &pSec, &tSec, inheritHandles,
+                                   helperCreationFlags, NULL, NULL, startupInfo, &pi);
+
+    if(attributeListInitialised)
+      DeleteProcThreadAttributeList(extendedSi.lpAttributeList);
+
+    SAFE_DELETE_ARRAY(attributeStorage);
+
+    if(inheritedPrimaryThread)
+      CloseHandle(inheritedPrimaryThread);
 
     SAFE_DELETE_ARRAY(paramsAlloc);
 
@@ -970,64 +1401,91 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
     return {ResultCode::Succeeded, (uint32_t)exitCode};
   }
 
-  InjectDLL(hProcess, renderdocPath);
-
   const char *rdoc_dll = STRINGIZE(RDOC_BASE_NAME);
-
-  uintptr_t loc = FindRemoteDLL(pid, STRINGIZE(RDOC_BASE_NAME) ".dll");
-
   rdcpair<RDResult, uint32_t> result = {ResultCode::Succeeded, 0};
 
-  if(loc == 0)
+  RemoteInvokeResult dllResult = InjectDLL(hProcess, suspendedPrimaryThread, renderdocPath);
+
+  if(dllResult != RemoteInvokeResult::Succeeded)
   {
-    SET_ERROR_RESULT(
-        result.first, ResultCode::InjectionFailed,
-        "Failed to inject %s.dll into process. Check that the process did not crash or exit "
-        "early in initialisation, e.g. if the working directory is incorrectly set.",
-        rdoc_dll);
+    SET_ERROR_RESULT(result.first, ResultCode::InjectionFailed,
+                     "Failed to execute the remote LoadLibraryW call for %s.dll.", rdoc_dll);
   }
   else
   {
-    // safe to cast away the const as we know these functions don't modify the parameters
+    uintptr_t loc = FindRemoteDLL(pid, STRINGIZE(RDOC_BASE_NAME) ".dll");
 
-    if(!capturefile.empty())
-      InjectFunctionCall(hProcess, loc, "INTERNAL_SetCaptureFile", (void *)capturefile.c_str(),
-                         capturefile.size() + 1);
-
-    rdcstr debugLogfile = RDCGETLOGFILE();
-
-    InjectFunctionCall(hProcess, loc, "INTERNAL_SetDebugLogFile", (void *)debugLogfile.c_str(),
-                       debugLogfile.size() + 1);
-
-    InjectFunctionCall(hProcess, loc, "INTERNAL_SetCaptureOptions", (CaptureOptions *)&opts,
-                       sizeof(CaptureOptions));
-
-    InjectFunctionCall(hProcess, loc, "INTERNAL_GetTargetControlIdent", &result.second,
-                       sizeof(result.second));
-
-    if(!env.empty())
+    if(loc == 0)
     {
-      for(const EnvironmentModification &e : env)
+      SET_ERROR_RESULT(
+          result.first, ResultCode::InjectionFailed,
+          "Failed to inject %s.dll into process. Check that the process did not crash or exit "
+          "early in initialisation, e.g. if the working directory is incorrectly set.",
+          rdoc_dll);
+    }
+    else
+    {
+      auto invoke = [&](const char *funcName, void *data, size_t dataLen) {
+        RemoteInvokeResult invokeResult =
+            InjectFunctionCall(hProcess, suspendedPrimaryThread, loc, funcName, data, dataLen);
+
+        if(invokeResult == RemoteInvokeResult::Succeeded)
+          return true;
+
+        SET_ERROR_RESULT(result.first, ResultCode::InjectionFailed,
+                         "Remote initialisation call '%s' failed.", funcName);
+        return false;
+      };
+
+      bool callsSucceeded = true;
+
+      // safe to cast away const as these functions don't modify the parameters
+      if(!capturefile.empty())
+        callsSucceeded =
+            invoke("INTERNAL_SetCaptureFile", (void *)capturefile.c_str(), capturefile.size() + 1);
+
+      rdcstr debugLogfile = RDCGETLOGFILE();
+
+      if(callsSucceeded)
+        callsSucceeded = invoke("INTERNAL_SetDebugLogFile", (void *)debugLogfile.c_str(),
+                                debugLogfile.size() + 1);
+
+      if(callsSucceeded)
+        callsSucceeded =
+            invoke("INTERNAL_SetCaptureOptions", (CaptureOptions *)&opts, sizeof(CaptureOptions));
+
+      if(callsSucceeded)
+        callsSucceeded =
+            invoke("INTERNAL_GetTargetControlIdent", &result.second, sizeof(result.second));
+
+      if(callsSucceeded && !env.empty())
       {
-        rdcstr name = e.name.trimmed();
-        rdcstr value = e.value;
-        EnvMod mod = e.mod;
-        EnvSep sep = e.sep;
+        for(const EnvironmentModification &e : env)
+        {
+          rdcstr name = e.name.trimmed();
+          rdcstr value = e.value;
+          EnvMod mod = e.mod;
+          EnvSep sep = e.sep;
 
-        if(name == "")
-          break;
+          if(name == "")
+            break;
 
-        InjectFunctionCall(hProcess, loc, "INTERNAL_EnvModName", (void *)name.c_str(),
-                           name.size() + 1);
-        InjectFunctionCall(hProcess, loc, "INTERNAL_EnvModValue", (void *)value.c_str(),
-                           value.size() + 1);
-        InjectFunctionCall(hProcess, loc, "INTERNAL_EnvSep", &sep, sizeof(sep));
-        InjectFunctionCall(hProcess, loc, "INTERNAL_EnvMod", &mod, sizeof(mod));
+          callsSucceeded = invoke("INTERNAL_EnvModName", (void *)name.c_str(), name.size() + 1) &&
+                           invoke("INTERNAL_EnvModValue", (void *)value.c_str(), value.size() + 1) &&
+                           invoke("INTERNAL_EnvSep", &sep, sizeof(sep)) &&
+                           invoke("INTERNAL_EnvMod", &mod, sizeof(mod));
+
+          if(!callsSucceeded)
+            break;
+        }
+
+        if(callsSucceeded)
+        {
+          // parameter is unused
+          void *dummy = NULL;
+          callsSucceeded = invoke("INTERNAL_ApplyEnvMods", &dummy, sizeof(dummy));
+        }
       }
-
-      // parameter is unused
-      void *dummy = NULL;
-      InjectFunctionCall(hProcess, loc, "INTERNAL_ApplyEnvMods", &dummy, sizeof(dummy));
     }
   }
 
@@ -1037,6 +1495,24 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
   CloseHandle(hProcess);
 
   return result;
+}
+
+rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
+                                                       const rdcarray<EnvironmentModification> &env,
+                                                       const rdcstr &capturefile,
+                                                       const CaptureOptions &opts, bool waitForExit)
+{
+  // Attaching to an arbitrary running process retains the compatibility path. Thread-context
+  // injection is only used when LaunchAndInjectIntoProcess can provide the known suspended primary
+  // thread that RenderDoc owns.
+  return InjectIntoProcessInternal(pid, env, capturefile, opts, waitForExit, NULL);
+}
+
+rdcpair<RDResult, uint32_t> Process::InjectIntoSuspendedProcess(
+    uint32_t pid, HANDLE suspendedPrimaryThread, const rdcarray<EnvironmentModification> &env,
+    const rdcstr &capturefile, const CaptureOptions &opts, bool waitForExit)
+{
+  return InjectIntoProcessInternal(pid, env, capturefile, opts, waitForExit, suspendedPrimaryThread);
 }
 
 uint32_t Process::LaunchProcess(const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
@@ -1163,7 +1639,8 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
     return {result, 0};
   }
 
-  rdcpair<RDResult, uint32_t> ret = InjectIntoProcess(pi.dwProcessId, {}, capturefile, opts, false);
+  rdcpair<RDResult, uint32_t> ret =
+      InjectIntoProcessInternal(pi.dwProcessId, {}, capturefile, opts, false, pi.hThread);
 
   CloseHandle(pi.hProcess);
   ResumeThread(pi.hThread);
@@ -1498,7 +1975,7 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
   renderdocPath = get_dirname(renderdocPath);
 
   // the native renderdoccmd.exe is always next to the dll. Wow32 will be somewhere else
-  rdcstr cmdpathNative = renderdocPath + "\\renderdoccmd.exe";
+  rdcstr cmdpathNative = renderdocPath + "\\rendertestcmd.exe";
   rdcstr cmdpathWow32;
 
   rdcstr shimpathNative = renderdocPath;
@@ -1507,7 +1984,7 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
 #if ENABLED(RDOC_X64)
 
   // native shim is just renderdocshim64.dll
-  shimpathNative = renderdocPath + "\\renderdocshim64.dll";
+  shimpathNative = renderdocPath + "\\rendertestshim64.dll";
 
   // if it looks like we're in the development environment, look for the alternate bitness in the
   // corresponding folder
@@ -1516,8 +1993,8 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
   {
     renderdocPath.erase(devLocation, ~0U);
 
-    shimpathWow32 = renderdocPath + "\\Win32\\Development\\renderdocshim32.dll";
-    cmdpathWow32 = renderdocPath + "\\Win32\\Development\\renderdoccmd.exe";
+    shimpathWow32 = renderdocPath + "\\Win32\\Development\\rendertestshim32.dll";
+    cmdpathWow32 = renderdocPath + "\\Win32\\Development\\rendertestcmd.exe";
   }
   else
   {
@@ -1527,22 +2004,22 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
     {
       renderdocPath.erase(devLocation, ~0U);
 
-      shimpathWow32 = renderdocPath + "\\Win32\\Release\\renderdocshim32.dll";
-      cmdpathWow32 = renderdocPath + "\\Win32\\Release\\renderdoccmd.exe";
+      shimpathWow32 = renderdocPath + "\\Win32\\Release\\rendertestshim32.dll";
+      cmdpathWow32 = renderdocPath + "\\Win32\\Release\\rendertestcmd.exe";
     }
   }
 
   // if we're not in the dev environment, assume it's under a x86\ subfolder
   if(devLocation < 0)
   {
-    shimpathWow32 = renderdocPath + "\\x86\\renderdocshim32.dll";
-    cmdpathWow32 = renderdocPath + "\\x86\\renderdoccmd.exe";
+    shimpathWow32 = renderdocPath + "\\x86\\rendertestshim32.dll";
+    cmdpathWow32 = renderdocPath + "\\x86\\rendertestcmd.exe";
   }
 
 #else
 
   // nothing fancy to do here for 32-bit, just point the shim next to our dll.
-  shimpathNative = renderdocPath + "\\renderdocshim32.dll";
+  shimpathNative = renderdocPath + "\\rendertestshim32.dll";
 
 #endif
 

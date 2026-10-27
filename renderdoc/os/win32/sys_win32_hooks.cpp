@@ -299,9 +299,9 @@ private:
       RDCDEBUG("Intercepting %s", entryPoint);
 
       // inherit logfile and capture options
-      rdcpair<RDResult, uint32_t> res = Process::InjectIntoProcess(
-          lpProcessInformation->dwProcessId, {}, RenderDoc::Inst().GetCaptureFileTemplate(),
-          RenderDoc::Inst().GetCaptureOptions(), false);
+      rdcpair<RDResult, uint32_t> res = Process::InjectIntoSuspendedProcess(
+          lpProcessInformation->dwProcessId, lpProcessInformation->hThread, {},
+          RenderDoc::Inst().GetCaptureFileTemplate(), RenderDoc::Inst().GetCaptureOptions(), false);
 
       if(res.first == ResultCode::Succeeded)
         RenderDoc::Inst().AddChildProcess((uint32_t)lpProcessInformation->dwProcessId, res.second);
@@ -337,7 +337,7 @@ private:
     {
       rdcstr app = strlower(StringFormat::Wide2UTF8(lpApplicationName));
 
-      if(app.contains("renderdoccmd.exe") || app.contains("qrenderdoc.exe"))
+      if(app.contains("rendertestcmd.exe") || app.contains("qrendertest.exe"))
       {
         inject = false;
       }
@@ -346,7 +346,7 @@ private:
     {
       rdcstr cmd = strlower(StringFormat::Wide2UTF8(lpCommandLine));
 
-      if(cmd.contains("renderdoccmd.exe") || cmd.contains("qrenderdoc.exe"))
+      if(cmd.contains("rendertestcmd.exe") || cmd.contains("qrendertest.exe"))
       {
         inject = false;
       }

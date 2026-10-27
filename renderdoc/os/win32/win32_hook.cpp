@@ -31,6 +31,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include "3rdparty/minhook/include/MinHook.h"
 #include "common/common.h"
 #include "common/threading.h"
 #include "hooks/hooks.h"
@@ -149,6 +150,8 @@ struct DllHookset
 struct CachedHookData
 {
   bool hookAll = true;
+  bool inlineGraphics = false;
+  std::set<void *> inlineTargets;
 
   std::map<rdcstr, DllHookset> DllHooks;
   HMODULE ownmodule = NULL;
@@ -289,10 +292,7 @@ struct CachedHookData
     if(modpath[0] == 0)
       return;
 
-    // windows 11 and newer versions have weird hotpatch DLLs that don't act like real DLLs. The
-    // LoadLibraryW below will fail for these DLLs even when using the module path provided.
-    // Only check the path for DLLs that might be a windows-hotpatch but if it matches we'll skip
-    // hooking these to avoid problems
+    // Windows hotpatch DLLs do not behave like regular modules. Skip those under WinSxS.
     if(strstr(lowername, "hotpatch"))
     {
       wchar_t lowerpath[1024] = {};
@@ -309,14 +309,24 @@ struct CachedHookData
         return;
     }
 
-    // increment the module reference count, so it doesn't disappear while we're processing it
-    // there's a very small race condition here between if GetModuleFileName returns, the module is
-    // unloaded then we load it again. The only way around that is inserting very scary locks
-    // between here
-    // and FreeLibrary that I want to avoid. Worst case, we load a dll, hook it, then unload it
-    // again.
-    HMODULE refcountModHandle = LoadLibraryW(modpath);
-    RDCASSERTEQUAL(refcountModHandle, module);
+    // Hold the existing mapping without reopening a file that the target may hide or redirect.
+    HMODULE refcountModHandle = NULL;
+    if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                          reinterpret_cast<LPCWSTR>(module), &refcountModHandle))
+    {
+      DWORD err = GetLastError();
+      RDCWARN("Skipping module %s: failed to acquire reference (%u)", modName, (uint32_t)err);
+      return;
+    }
+
+    if(refcountModHandle != module)
+    {
+      RDCWARN("Skipping module %s: reference resolved to %p instead of %p", modName,
+              refcountModHandle, module);
+      FreeLibrary(refcountModHandle);
+      return;
+    }
+
     byte *baseAddress = (byte *)refcountModHandle;
 
     PIMAGE_DOS_HEADER dosheader = (PIMAGE_DOS_HEADER)baseAddress;
@@ -523,6 +533,66 @@ struct CachedHookData
 
 static CachedHookData *s_HookData = NULL;
 
+static void InstallInlineGraphicsHooks()
+{
+  if(!s_HookData->inlineGraphics)
+    return;
+
+  bool queued = false;
+  for(auto &dll : s_HookData->DllHooks)
+  {
+    if(!dll.second.module)
+      continue;
+
+    for(FunctionHook &hook : dll.second.FunctionHooks)
+    {
+      const bool device = (dll.first == "d3d12.dll" || dll.first == "sl.interposer.dll") &&
+                          hook.function == "D3D12CreateDevice";
+      const bool factory = dll.first == "dxgi.dll" &&
+                           (hook.function == "CreateDXGIFactory" ||
+                            hook.function == "CreateDXGIFactory1" ||
+                            hook.function == "CreateDXGIFactory2");
+      if((!device && !factory) || !hook.orig)
+        continue;
+
+      void *target = (void *)GetProcAddress(dll.second.module, hook.function.c_str());
+      if(!target || s_HookData->inlineTargets.find(target) != s_HookData->inlineTargets.end())
+        continue;
+
+      void *trampoline = NULL;
+      MH_STATUS status = MH_CreateHook(target, hook.hook, &trampoline);
+      if(status != MH_OK)
+      {
+        RDCWARN("Inline graphics hook %s!%s failed: %s", dll.first.c_str(), hook.function.c_str(),
+                MH_StatusToString(status));
+        continue;
+      }
+
+      // Publish the onward call before redirecting cached pointers to the hook.
+      *hook.orig = trampoline;
+      s_HookData->inlineTargets.insert(target);
+      status = MH_QueueEnableHook(target);
+      if(status == MH_OK)
+      {
+        queued = true;
+        RDCLOG("Installing inline graphics hook %s!%s", dll.first.c_str(), hook.function.c_str());
+      }
+      else
+      {
+        RDCWARN("Couldn't queue inline graphics hook %s: %s", hook.function.c_str(),
+                MH_StatusToString(status));
+      }
+    }
+  }
+
+  if(queued)
+  {
+    MH_STATUS status = MH_ApplyQueued();
+    if(status != MH_OK)
+      RDCERR("Couldn't enable inline graphics hooks: %s", MH_StatusToString(status));
+  }
+}
+
 #ifdef UNICODE
 #undef MODULEENTRY32
 #undef Module32First
@@ -595,6 +665,8 @@ static void HookAllModules()
 
   if(prev != 0)
     return;
+
+  InstallInlineGraphicsHooks();
 
   // for all loaded modules, call callbacks now
   for(auto it = s_HookData->DllHooks.begin(); it != s_HookData->DllHooks.end(); ++it)
@@ -767,6 +839,18 @@ FARPROC WINAPI Hooked_GetProcAddress(HMODULE mod, const LPCSTR func)
   if(mod == NULL || func == NULL || mod == s_HookData->ownmodule)
     return GetProcAddress(mod, func);
 
+  const bool traceGraphics =
+      !OrdinalAsString((void *)func) &&
+      (!strcmp(func, "D3D12CreateDevice") || !strcmp(func, "D3D12GetInterface") ||
+       !strcmp(func, "D3D12GetDebugInterface") || !strcmp(func, "CreateDXGIFactory") ||
+       !strcmp(func, "CreateDXGIFactory1") || !strcmp(func, "CreateDXGIFactory2"));
+  if(traceGraphics)
+  {
+    char filename[MAX_PATH] = {};
+    GetModuleFileNameA(mod, filename, MAX_PATH);
+    RDCLOG("Graphics lookup %s in %s (%p)", func, filename, mod);
+  }
+
 #if ENABLED(VERBOSE_DEBUG_HOOK)
   if(OrdinalAsString((void *)func))
     RDCDEBUG("Hooked_GetProcAddress(%p, %p)", mod, func);
@@ -862,6 +946,8 @@ FARPROC WINAPI Hooked_GetProcAddress(HMODULE mod, const LPCSTR func)
         if(realfunc == NULL)
           return NULL;
 
+        if(traceGraphics)
+          RDCLOG("Graphics lookup %s redirected to %p (original %p)", func, found->hook, realfunc);
         return (FARPROC)found->hook;
       }
     }
@@ -873,6 +959,8 @@ FARPROC WINAPI Hooked_GetProcAddress(HMODULE mod, const LPCSTR func)
 
   SetLastError(S_OK);
 
+  if(traceGraphics)
+    RDCLOG("Graphics lookup %s has no matching hook", func);
   return GetProcAddress(mod, func);
 }
 static void InitHookData()
@@ -880,6 +968,22 @@ static void InitHookData()
   if(!s_HookData)
   {
     s_HookData = new CachedHookData;
+
+    char inlineGraphics[2] = {};
+    if(GetEnvironmentVariableA("RENDERDOC_WIN32_INLINE_GRAPHICS_HOOKS", inlineGraphics,
+                               sizeof(inlineGraphics)) == 1 && inlineGraphics[0] == '1')
+    {
+      MH_STATUS status = MH_Initialize();
+      if(status == MH_OK)
+      {
+        s_HookData->inlineGraphics = true;
+        RDCLOG("Optional inline graphics hooks enabled");
+      }
+      else
+      {
+        RDCWARN("Couldn't initialise inline graphics hooks: %s", MH_StatusToString(status));
+      }
+    }
 
     RDCASSERT(s_HookData->DllHooks.empty());
     s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
@@ -990,6 +1094,15 @@ void LibraryHooks::ReplayInitialise()
 void LibraryHooks::RemoveHooks()
 {
   LibraryHooks::RemoveHookCallbacks();
+
+  if(s_HookData->inlineGraphics)
+  {
+    s_HookData->inlineGraphics = false;
+    MH_STATUS status = MH_DisableHook(MH_ALL_HOOKS);
+    if(status != MH_OK)
+      RDCERR("Couldn't disable inline graphics hooks: %s", MH_StatusToString(status));
+    // Keep trampolines alive for any onward calls already in flight.
+  }
 
   for(auto it = s_InstalledHooks.begin(); it != s_InstalledHooks.end(); ++it)
   {
