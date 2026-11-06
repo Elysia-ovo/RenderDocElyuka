@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "d3d12_device.h"
+#include "d3d12_portable_allocations.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "d3d12_resources.h"
 
@@ -451,6 +452,13 @@ HRESULT WrappedID3D12Device::CreateResource(
 
   if(IsCaptureMode(m_State))
   {
+    if(pHeap)
+    {
+      const UINT allocationVersion = chunkType == D3D12Chunk::Device_CreatePlacedResource2 ? 3 :
+                                     chunkType == D3D12Chunk::Device_CreatePlacedResource1 ? 2 : 0;
+      D3D12RecordPortableResource(m_pDevice, wrapped->GetResourceID(), GetResID(pHeap), HeapOffset,
+                                  allocationVersion, desc, NumCastableFormats, pCastableFormats);
+    }
     if(HeapFlags & D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT)
       wrapped->Evict();
 

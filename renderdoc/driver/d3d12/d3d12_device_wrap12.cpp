@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "d3d12_device.h"
+#include "d3d12_portable_allocations.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "d3d12_command_queue.h"
 #include "d3d12_resources.h"
@@ -34,7 +35,12 @@ D3D12_RESOURCE_ALLOCATION_INFO WrappedID3D12Device::GetResourceAllocationInfo3(
     _In_opt_count_(numResourceDescs) const DXGI_FORMAT *const *ppCastableFormats,
     _Out_writes_opt_(numResourceDescs) D3D12_RESOURCE_ALLOCATION_INFO1 *pResourceAllocationInfo1)
 {
-  return m_pDevice12->GetResourceAllocationInfo3(visibleMask, numResourceDescs, pResourceDescs,
-                                                 pNumCastableFormats, ppCastableFormats,
-                                                 pResourceAllocationInfo1);
+  D3D12_RESOURCE_ALLOCATION_INFO native = m_pDevice12->GetResourceAllocationInfo3(
+      visibleMask, numResourceDescs, pResourceDescs, pNumCastableFormats, ppCastableFormats,
+      pResourceAllocationInfo1);
+  if(!IsCaptureMode(m_State))
+    return native;
+  return D3D12PortableAllocationInfo(m_pDevice, 3, visibleMask, numResourceDescs, pResourceDescs,
+                                    pNumCastableFormats, ppCastableFormats, native,
+                                    pResourceAllocationInfo1);
 }

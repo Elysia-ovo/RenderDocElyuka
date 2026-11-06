@@ -22,6 +22,19 @@ RenderDoc has initial support for D3D12, but it contains some caveats. In additi
 
 For more information about RenderDoc's raytracing support see :doc:`raytracing`.
 
+Application profile allocation differences
+------------------------------------------
+
+Some GPU drivers change texture allocation sizes according to the executable's application profile. A placed resource can therefore fit its captured heap but fail to fit when recreated by the replay application on the same GPU.
+
+The ``D3D12_Capture_NormaliseResourceAllocations`` setting, enabled by default, compares all four ``GetResourceAllocationInfo`` variants with a private helper on the same adapter LUID. The helper runs in the companion command-line executable next to the capture library, outside the game's application profile. Capture queries return the larger size and alignment requirement. Batch queries also recalculate each resource offset so a larger texture cannot overlap the next suballocation. Unchanged queries preserve the driver's original result. This requires no change to the capture format or replay application, and does not edit installed driver profiles or rename the game executable.
+
+Requirements are cached per adapter, API version, visibility mask, complete resource description, and castable format list. Helper startup and communication have timeouts. If the helper is missing, disconnects, or cannot support a resource, the capture log reports the failure and the native query result is retained. Such a capture is not guaranteed to be portable.
+
+An aliasing barrier can refer to resources that overlap only in the extra space reported by these queries. Where either physical layout has no overlap, capture broadens the barrier's before-resource to ``NULL``. This conservatively synchronises all previous aliases of the after-resource and is valid in both layouts. The same broadened barrier is recorded in the capture. Resource ranges are tracked by resource ID and removed when each resource is released.
+
+This addresses allocation decisions made through the wrapped capture device. It cannot repair old captures or allocations whose sizes and offsets bypass these queries. The helper uses the system D3D12 runtime; newer application-specific Agility SDK features may be unavailable. Replay on other GPUs, driver versions, or application profiles can still have different requirements.
+
 RenderDoc extensions
 --------------------
 

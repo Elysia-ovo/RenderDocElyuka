@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "d3d12_device.h"
+#include "d3d12_portable_allocations.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "d3d12_resources.h"
 
@@ -31,8 +32,12 @@ D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE WrappedID3D12Device::GetResourc
     _In_reads_(numResourceDescs) const D3D12_RESOURCE_DESC1 *pResourceDescs,
     _Out_writes_opt_(numResourceDescs) D3D12_RESOURCE_ALLOCATION_INFO1 *pResourceAllocationInfo1)
 {
-  return m_pDevice8->GetResourceAllocationInfo2(visibleMask, numResourceDescs, pResourceDescs,
-                                                pResourceAllocationInfo1);
+  D3D12_RESOURCE_ALLOCATION_INFO native = m_pDevice8->GetResourceAllocationInfo2(
+      visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+  if(!IsCaptureMode(m_State))
+    return native;
+  return D3D12PortableAllocationInfo(m_pDevice, 2, visibleMask, numResourceDescs, pResourceDescs,
+                                    NULL, NULL, native, pResourceAllocationInfo1);
 }
 
 void STDMETHODCALLTYPE WrappedID3D12Device::CreateSamplerFeedbackUnorderedAccessView(

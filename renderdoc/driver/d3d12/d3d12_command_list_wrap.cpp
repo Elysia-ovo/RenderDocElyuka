@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "d3d12_command_list.h"
+#include "d3d12_portable_allocations.h"
 #include <algorithm>
 #include "core/settings.h"
 #include "driver/dxgi/dxgi_common.h"
@@ -584,6 +585,7 @@ void WrappedID3D12GraphicsCommandList::ResourceBarrier(UINT NumBarriers,
                                                        const D3D12_RESOURCE_BARRIER *pBarriers)
 {
   D3D12_RESOURCE_BARRIER *barriers = m_pDevice->GetTempArray<D3D12_RESOURCE_BARRIER>(NumBarriers);
+  rdcarray<D3D12_RESOURCE_BARRIER> portableBarriers;
 
   for(UINT i = 0; i < NumBarriers; i++)
   {
@@ -595,6 +597,19 @@ void WrappedID3D12GraphicsCommandList::ResourceBarrier(UINT NumBarriers,
     }
     else if(barriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
     {
+      if(IsCaptureMode(m_State) && barriers[i].Aliasing.pResourceBefore &&
+         barriers[i].Aliasing.pResourceAfter &&
+         D3D12PortableAliasNeedsWildcard(GetResID(barriers[i].Aliasing.pResourceBefore),
+                                         GetResID(barriers[i].Aliasing.pResourceAfter)))
+      {
+        // Padding exposed by portable allocation queries can alias even when the native
+        // textures don't. A NULL before-resource synchronises all possible prior aliases,
+        // and is legal for both physical layouts. Record this conservative barrier too.
+        if(portableBarriers.empty())
+          portableBarriers.assign(pBarriers, NumBarriers);
+        portableBarriers[i].Aliasing.pResourceBefore = NULL;
+        barriers[i].Aliasing.pResourceBefore = NULL;
+      }
       barriers[i].Aliasing.pResourceBefore = Unwrap(barriers[i].Aliasing.pResourceBefore);
       barriers[i].Aliasing.pResourceAfter = Unwrap(barriers[i].Aliasing.pResourceAfter);
     }
@@ -608,6 +623,8 @@ void WrappedID3D12GraphicsCommandList::ResourceBarrier(UINT NumBarriers,
 
   if(IsCaptureMode(m_State))
   {
+    if(!portableBarriers.empty())
+      pBarriers = portableBarriers.data();
     CACHE_THREAD_SERIALISER();
     SCOPED_SERIALISE_CHUNK(D3D12Chunk::List_ResourceBarrier);
     Serialise_ResourceBarrier(ser, NumBarriers, pBarriers);

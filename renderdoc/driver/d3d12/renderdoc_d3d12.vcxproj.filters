@@ -33,6 +33,9 @@
     <ClInclude Include="d3d12_common.h">
       <Filter>Util</Filter>
     </ClInclude>
+    <ClInclude Include="d3d12_portable_allocations.h">
+      <Filter>Util</Filter>
+    </ClInclude>
     <ClInclude Include="d3d12_device.h">
       <Filter>Core IFaces</Filter>
     </ClInclude>
@@ -90,6 +93,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="d3d12_common.cpp">
+      <Filter>Util</Filter>
+    </ClCompile>
+    <ClCompile Include="d3d12_portable_allocations.cpp">
       <Filter>Util</Filter>
     </ClCompile>
     <ClCompile Include="d3d12_hooks.cpp">

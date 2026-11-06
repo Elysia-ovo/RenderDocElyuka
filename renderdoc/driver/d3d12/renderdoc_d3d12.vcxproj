@@ -111,6 +111,7 @@
     <ClCompile Include="d3d12_command_list_wrap.cpp" />
     <ClCompile Include="d3d12_command_queue_wrap.cpp" />
     <ClCompile Include="d3d12_common.cpp" />
+    <ClCompile Include="d3d12_portable_allocations.cpp" />
     <ClCompile Include="d3d12_counters.cpp" />
     <ClCompile Include="d3d12_debug.cpp" />
     <ClCompile Include="d3d12_device.cpp" />
@@ -162,6 +163,7 @@
     <ClInclude Include="d3d12_command_list.h" />
     <ClInclude Include="d3d12_command_queue.h" />
     <ClInclude Include="d3d12_common.h" />
+    <ClInclude Include="d3d12_portable_allocations.h" />
     <ClInclude Include="d3d12_debug.h" />
     <ClInclude Include="d3d12_device.h" />
     <ClInclude Include="d3d12_dxil_debug.h" />

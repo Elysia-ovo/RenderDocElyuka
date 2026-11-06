@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "d3d12_resources.h"
+#include "d3d12_portable_allocations.h"
 #include "driver/shaders/dxbc/dxbc_reflect.h"
 #include "driver/shaders/dxil/dxil_metadata.h"
 #include "d3d12_command_list.h"
@@ -226,6 +227,8 @@ bool WrappedID3D12Resource::CreateAccStruct(ResourceId id, D3D12BufferOffset buf
 
 WrappedID3D12Resource::~WrappedID3D12Resource()
 {
+  if(IsCaptureMode(m_pDevice->GetState()))
+    D3D12ForgetPortableResource(GetResourceID());
   SAFE_RELEASE(m_Pageable);
   SAFE_RELEASE(m_Heap);
 

@@ -37,6 +37,9 @@
 #include <shlobj.h>
 #include <tlhelp32.h>
 
+extern "C" __declspec(dllimport) int RENDERDOC_CC INTERNAL_D3D12AllocationServer(
+    const char *pipeName, uint32_t parentPID);
+
 static std::string conv(const std::wstring &str)
 {
   std::string ret;
@@ -910,6 +913,11 @@ int main(int, char *)
     argv.push_back("renderdoccmd");
 
   LocalFree(wargv);
+
+  // Private capture allocation helper. Run before UI/command initialisation; the main exe's
+  // replay marker keeps this native D3D12 device outside capture hooks.
+  if(argv.size() == 4 && argv[1] == "d3d12alloc")
+    return INTERNAL_D3D12AllocationServer(argv[2].c_str(), strtoul(argv[3].c_str(), NULL, 10));
 
   hInstance = GetModuleHandleA(NULL);
 

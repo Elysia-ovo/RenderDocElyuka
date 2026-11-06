@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "d3d12_device.h"
+#include "d3d12_portable_allocations.h"
 #include "core/settings.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "driver/ihv/amd/official/DXExt/AmdExtD3D.h"
@@ -2514,7 +2515,19 @@ UINT WrappedID3D12Device::GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP
 D3D12_RESOURCE_ALLOCATION_INFO WrappedID3D12Device::GetResourceAllocationInfo(
     UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC *pResourceDescs)
 {
-  return m_pDevice->GetResourceAllocationInfo(visibleMask, numResourceDescs, pResourceDescs);
+  D3D12_RESOURCE_ALLOCATION_INFO native =
+      m_pDevice->GetResourceAllocationInfo(visibleMask, numResourceDescs, pResourceDescs);
+  if(!IsCaptureMode(m_State) || !pResourceDescs || native.SizeInBytes == ~0ULL)
+    return native;
+  rdcarray<D3D12_RESOURCE_DESC1> descs;
+  descs.resize(numResourceDescs);
+  for(UINT i = 0; i < numResourceDescs; i++)
+  {
+    RDCEraseEl(descs[i]);
+    memcpy(&descs[i], &pResourceDescs[i], sizeof(D3D12_RESOURCE_DESC));
+  }
+  return D3D12PortableAllocationInfo(m_pDevice, 0, visibleMask, numResourceDescs, descs.data(),
+                                    NULL, NULL, native, NULL);
 }
 
 D3D12_HEAP_PROPERTIES WrappedID3D12Device::GetCustomHeapProperties(UINT nodeMask,

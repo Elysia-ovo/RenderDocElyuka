@@ -308,6 +308,8 @@ static ContextInjectionResult InjectViaSetThreadContext(HANDLE hProcess, HANDLE 
                 "Unexpected x64 remote call state layout");
 
   unsigned char shellcode[] = {
+      0x48, 0x83, 0xE4, 0xF0,                                        // and rsp, -16
+      0x48, 0x83, 0xEC, 0x20,                                        // sub rsp, 32 (shadow store)
       0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,    // mov rcx, arg
       0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,    // mov rax, func
       0xFF, 0xD0,                                                    // call rax
@@ -318,18 +320,20 @@ static ContextInjectionResult InjectViaSetThreadContext(HANDLE hProcess, HANDLE 
       0xEB, 0xFC,                                                    // jmp pause
   };
 
-  const size_t loopOffset = 42;
+  const size_t loopOffset = 50;
   uintptr_t arg = (uintptr_t)remoteArg;
   uintptr_t func = (uintptr_t)remoteFunc;
   uintptr_t stateAddr = (uintptr_t)stateMem;
-  memcpy(shellcode + 2, &arg, sizeof(arg));
-  memcpy(shellcode + 12, &func, sizeof(func));
-  memcpy(shellcode + 24, &stateAddr, sizeof(stateAddr));
+  memcpy(shellcode + 10, &arg, sizeof(arg));
+  memcpy(shellcode + 20, &func, sizeof(func));
+  memcpy(shellcode + 32, &stateAddr, sizeof(stateAddr));
 #else
   static_assert(offsetof(RemoteCallState, completed) == 4,
                 "Unexpected x86 remote call state layout");
 
   unsigned char shellcode[] = {
+      0x83, 0xE4, 0xF0,                            // and esp, -16
+      0x83, 0xEC, 0x0C,                            // sub esp, 12 (align before push/call)
       0x68, 0x00, 0x00, 0x00, 0x00,                // push arg
       0xB8, 0x00, 0x00, 0x00, 0x00,                // mov eax, func
       0xFF, 0xD0,                                  // call eax
@@ -340,13 +344,13 @@ static ContextInjectionResult InjectViaSetThreadContext(HANDLE hProcess, HANDLE 
       0xEB, 0xFC,                                  // jmp pause
   };
 
-  const size_t loopOffset = 26;
+  const size_t loopOffset = 32;
   uintptr_t arg = (uintptr_t)remoteArg;
   uintptr_t func = (uintptr_t)remoteFunc;
   uintptr_t stateAddr = (uintptr_t)stateMem;
-  memcpy(shellcode + 1, &arg, sizeof(arg));
-  memcpy(shellcode + 6, &func, sizeof(func));
-  memcpy(shellcode + 13, &stateAddr, sizeof(stateAddr));
+  memcpy(shellcode + 7, &arg, sizeof(arg));
+  memcpy(shellcode + 12, &func, sizeof(func));
+  memcpy(shellcode + 19, &stateAddr, sizeof(stateAddr));
 #endif
 
   void *shellcodeMem =
@@ -382,14 +386,14 @@ static ContextInjectionResult InjectViaSetThreadContext(HANDLE hProcess, HANDLE 
 
 #if defined(_M_X64) || defined(__x86_64__)
   callCtx.Rip = (DWORD64)shellcodeMem;
-
-  // Present a valid Windows x64 call site. The pre-call RSP is 16-byte aligned and the 32 bytes
-  // above it are reserved as the mandatory shadow store. The original RSP is restored afterwards.
-  callCtx.Rsp = (origCtx.Rsp & ~DWORD64(0xF)) - 0x40;
 #else
   callCtx.Eip = (DWORD)(uintptr_t)shellcodeMem;
-  callCtx.Esp = (origCtx.Esp & ~DWORD(0xF)) - 0x40;
 #endif
+
+  // A freshly created thread still has to run the Windows loader before reaching the redirected
+  // instruction pointer. Preserve its startup stack: aligning it here changes the alignment seen
+  // by the loader and can fault on an aligned SIMD store before our trampoline is reached. The
+  // trampoline aligns its own call frame and reserves argument space only after loader startup.
 
   if(!SetThreadContext(hThread, &callCtx))
   {

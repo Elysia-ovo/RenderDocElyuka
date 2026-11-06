@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "d3d12_device.h"
+#include "d3d12_portable_allocations.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "driver/ihv/amd/official/DXExt/AmdExtD3D.h"
 #include "driver/ihv/amd/official/DXExt/AmdExtD3DCommandListMarkerApi.h"
@@ -340,8 +341,19 @@ D3D12_RESOURCE_ALLOCATION_INFO WrappedID3D12Device::GetResourceAllocationInfo1(
     _In_reads_(numResourceDescs) const D3D12_RESOURCE_DESC *pResourceDescs,
     _Out_writes_opt_(numResourceDescs) D3D12_RESOURCE_ALLOCATION_INFO1 *pResourceAllocationInfo1)
 {
-  return m_pDevice4->GetResourceAllocationInfo1(visibleMask, numResourceDescs, pResourceDescs,
-                                                pResourceAllocationInfo1);
+  D3D12_RESOURCE_ALLOCATION_INFO native = m_pDevice4->GetResourceAllocationInfo1(
+      visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+  if(!IsCaptureMode(m_State) || !pResourceDescs || native.SizeInBytes == ~0ULL)
+    return native;
+  rdcarray<D3D12_RESOURCE_DESC1> descs;
+  descs.resize(numResourceDescs);
+  for(UINT i = 0; i < numResourceDescs; i++)
+  {
+    RDCEraseEl(descs[i]);
+    memcpy(&descs[i], &pResourceDescs[i], sizeof(D3D12_RESOURCE_DESC));
+  }
+  return D3D12PortableAllocationInfo(m_pDevice, 1, visibleMask, numResourceDescs, descs.data(),
+                                    NULL, NULL, native, pResourceAllocationInfo1);
 }
 
 ID3D12Fence *WrappedID3D12Device::CreateProtectedSessionFence(ID3D12Fence *real)
